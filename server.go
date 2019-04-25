@@ -5,25 +5,44 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/labstack/echo"
-	"github.com/labstack/echo/middleware"
 	"golang.org/x/net/webdav"
 )
 
-func healthSkipper(c echo.Context) bool {
-	if c.Path() == "/health" {
-		return true
-	}
-	return false
+type logResponseWrite struct {
+	http.ResponseWriter
+	code int
 }
 
-func basicAuthValidator(authString string) func(string, string, echo.Context) (bool, error) {
-	return func(username string, password string, c echo.Context) (bool, error) {
-		if username+":"+password == authString {
-			return true, nil
+func (l *logResponseWrite) WriteHeader(code int) {
+	l.ResponseWriter.WriteHeader(code)
+	l.code = code
+}
+
+func logMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wr := &logResponseWrite{ResponseWriter: w, code: http.StatusOK}
+		h.ServeHTTP(wr, r)
+		log.Printf("[%d] %s %s %s", wr.code, r.Method, r.URL, r.RemoteAddr)
+
+	})
+}
+func basicAuthMiddleware(h http.Handler, authString string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+
+		username, password, auth := r.BasicAuth()
+		if !auth {
+			http.Error(w, "Not Authorized", http.StatusUnauthorized)
+			return
 		}
-		return false, nil
-	}
+
+		if username+":"+password != authString {
+			http.Error(w, "Not Authorized", http.StatusUnauthorized)
+			return
+		}
+
+		h.ServeHTTP(w, r)
+	})
 }
 
 func main() {
@@ -43,27 +62,12 @@ func main() {
 	}
 	log.Printf("Port: %s, Directory: %s", port, directory)
 
-	e := echo.New()
-	e.HideBanner = true
-	authConfig := middleware.BasicAuthConfig{
-		Skipper:   healthSkipper,
-		Validator: basicAuthValidator(basicAuth),
-	}
-
 	srv := &webdav.Handler{
 		FileSystem: webdav.Dir("./"),
 		LockSystem: webdav.NewMemLS(),
 	}
 
-	e.Use(middleware.Recover())
-	e.Use(middleware.Logger())
-	e.Use(middleware.BasicAuthWithConfig(authConfig))
-
-	e.GET("health", func(c echo.Context) error {
-		return c.String(http.StatusOK, "OK")
-	})
-	e.Any("/*", echo.WrapHandler(srv))
-	if err := e.Start(":" + port); err != nil {
+	if err := http.ListenAndServe(":"+port, logMiddleware(basicAuthMiddleware(srv, basicAuth))); err != nil {
 		log.Fatal(err)
 	}
 }
